@@ -430,9 +430,9 @@ if ($message) {
 
     // User enters coins
     if ($state === "AWAIT_AMAZON_COINS" && $text !== null) {
-        if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Send a valid number (minimum 20)."); exit; }
+        if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Send a valid number (minimum 30)."); exit; }
         $coins = intval($text);
-        if ($coins < 20) { sendMessage($chat_id, "❌ Minimum is 20 coins. Send again:"); exit; }
+        if ($coins < 30) { sendMessage($chat_id, "❌ Minimum is 20 coins. Send again:"); exit; }
 
         $order_id = create_order($user_id, "DEPOSIT", "PENDING", [
             "method" => "AMAZON",
@@ -776,7 +776,7 @@ if ($callback) {
     if ($data === "pay:amazon") {
         answerCallback($cb_id, "Amazon selected");
         set_state($user_id, "AWAIT_AMAZON_COINS", []);
-        sendMessage($chat_id, "Enter the number of coins to add (Method: Amazon):\n\n✅ Minimum: 20");
+        sendMessage($chat_id, "Enter the number of coins to add (Method: Amazon):\n\n✅ Minimum: 30");
         exit;
     }
 
