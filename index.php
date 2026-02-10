@@ -6,15 +6,13 @@
 // ✅ Admin Orders List (pending deposits)
 // ✅ Gift card input accepts ANY text (no numeric validation)
 // ✅ "Enter your Amazon Gift Card :" text
+// ✅ MINIMUM coins to add = 30
 //
 // IMPORTANT NOTE (DB):
 // Your SQL earlier had orders.gift_amount as INT.
 // To keep this script working WITHOUT changing SQL,
 // we store gift card CODE/TEXT inside orders.method as:
 // "AMAZON | CODE: <text>"
-// (gift_amount is not used anymore for code)
-//
-// If you WANT to store code in gift_amount, change that column to TEXT.
 // ===============================
 
 // ------------------- CONFIG -------------------
@@ -260,7 +258,6 @@ function create_order($user_id, $otype, $status, $fields=[]) {
     $vals = [":uid",":ot",":st"];
     $params = [":uid"=>$user_id, ":ot"=>$otype, ":st"=>$status];
 
-    // gift_amount kept in list but we won't store code there to avoid INT column issue
     $allowed = ["method","coins_requested","gift_amount","photo_file_id","ctype","qty","total_cost","codes_text"];
     foreach ($allowed as $k) {
         if (array_key_exists($k, $fields)) {
@@ -428,11 +425,11 @@ if ($message) {
         exit;
     }
 
-    // User enters coins
+    // User enters coins (✅ minimum 30)
     if ($state === "AWAIT_AMAZON_COINS" && $text !== null) {
         if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Send a valid number (minimum 30)."); exit; }
         $coins = intval($text);
-        if ($coins < 30) { sendMessage($chat_id, "❌ Minimum is 20 coins. Send again:"); exit; }
+        if ($coins < 30) { sendMessage($chat_id, "❌ Minimum is 30 coins. Send again:"); exit; }
 
         $order_id = create_order($user_id, "DEPOSIT", "PENDING", [
             "method" => "AMAZON",
@@ -459,7 +456,7 @@ if ($message) {
         exit;
     }
 
-    // ✅ Gift card input: ANY TEXT (no numeric validation)
+    // ✅ Gift card input: ANY TEXT
     if ($state === "AWAIT_GIFT_AMOUNT" && $text !== null) {
         $gift_code = trim($text);
         if ($gift_code === "") {
@@ -474,7 +471,6 @@ if ($message) {
             exit;
         }
 
-        // store code inside method to avoid DB type issues
         $new_method = "AMAZON | CODE: " . $gift_code;
         update_order($order_id, ["method"=>$new_method, "status"=>"PENDING"]);
 
@@ -494,11 +490,9 @@ if ($message) {
 
         sendMessage($chat_id, "✅ Admin is checking your code.\n⏳ Please wait for approval.");
 
-        // notify admins
         $o = get_order($order_id);
         $time = date("d M Y, h:i A", strtotime($o["created_at"]));
 
-        // extract code from method if present
         $codeText = "";
         if (!empty($o["method"]) && strpos($o["method"], "CODE:") !== false) {
             $codeText = trim(substr($o["method"], strpos($o["method"], "CODE:") + 5));
@@ -784,7 +778,6 @@ if ($callback) {
         $order_id = intval($m[1]);
         answerCallback($cb_id, "Proceeding...");
         set_state($user_id, "AWAIT_GIFT_AMOUNT", ["order_id"=>$order_id]);
-        // ✅ changed text
         sendMessage($chat_id, "Enter your Amazon Gift Card :");
         exit;
     }
