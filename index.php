@@ -4,6 +4,17 @@
 // ✅ Selling Bot (COINS + Coupons)
 // ✅ Supabase Postgres via PDO
 // ✅ Admin Orders List (pending deposits)
+// ✅ Gift card input accepts ANY text (no numeric validation)
+// ✅ "Enter your Amazon Gift Card :" text
+//
+// IMPORTANT NOTE (DB):
+// Your SQL earlier had orders.gift_amount as INT.
+// To keep this script working WITHOUT changing SQL,
+// we store gift card CODE/TEXT inside orders.method as:
+// "AMAZON | CODE: <text>"
+// (gift_amount is not used anymore for code)
+//
+// If you WANT to store code in gift_amount, change that column to TEXT.
 // ===============================
 
 // ------------------- CONFIG -------------------
@@ -249,6 +260,7 @@ function create_order($user_id, $otype, $status, $fields=[]) {
     $vals = [":uid",":ot",":st"];
     $params = [":uid"=>$user_id, ":ot"=>$otype, ":st"=>$status];
 
+    // gift_amount kept in list but we won't store code there to avoid INT column issue
     $allowed = ["method","coins_requested","gift_amount","photo_file_id","ctype","qty","total_cost","codes_text"];
     foreach ($allowed as $k) {
         if (array_key_exists($k, $fields)) {
@@ -447,14 +459,25 @@ if ($message) {
         exit;
     }
 
-    // User enters gift amount
+    // ✅ Gift card input: ANY TEXT (no numeric validation)
     if ($state === "AWAIT_GIFT_AMOUNT" && $text !== null) {
-        if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Send a valid gift card amount number."); exit; }
-        $gift_amt = intval($text);
-        $order_id = intval($data["order_id"] ?? 0);
-        if ($order_id <= 0) { clear_state($user_id); sendMessage($chat_id, "❌ Order missing. Start again."); exit; }
+        $gift_code = trim($text);
+        if ($gift_code === "") {
+            sendMessage($chat_id, "❌ Please enter your Amazon Gift Card :");
+            exit;
+        }
 
-        update_order($order_id, ["gift_amount"=>$gift_amt, "status"=>"PENDING"]);
+        $order_id = intval($data["order_id"] ?? 0);
+        if ($order_id <= 0) {
+            clear_state($user_id);
+            sendMessage($chat_id, "❌ Order missing. Start again.");
+            exit;
+        }
+
+        // store code inside method to avoid DB type issues
+        $new_method = "AMAZON | CODE: " . $gift_code;
+        update_order($order_id, ["method"=>$new_method, "status"=>"PENDING"]);
+
         set_state($user_id, "AWAIT_GIFT_PHOTO", ["order_id"=>$order_id]);
         sendMessage($chat_id, "📸 Now upload a screenshot of the gift card:");
         exit;
@@ -474,11 +497,18 @@ if ($message) {
         // notify admins
         $o = get_order($order_id);
         $time = date("d M Y, h:i A", strtotime($o["created_at"]));
+
+        // extract code from method if present
+        $codeText = "";
+        if (!empty($o["method"]) && strpos($o["method"], "CODE:") !== false) {
+            $codeText = trim(substr($o["method"], strpos($o["method"], "CODE:") + 5));
+        }
+
         $adminText = "🆕 <b>Deposit Request</b>\n".
                      "🧾 Order: <b>#{$order_id}</b>\n".
                      "👤 User: @{$username} (<code>{$user_id}</code>)\n".
                      "🪙 Coins: <b>{$o["coins_requested"]}</b>\n".
-                     "🎁 Gift Amount: <b>{$o["gift_amount"]}</b>\n".
+                     "🎁 Gift Card: <b>".htmlspecialchars($codeText)."</b>\n".
                      "⏰ Time: <b>{$time}</b>\n";
 
         $adminRm = [
@@ -606,14 +636,18 @@ if ($message) {
             $uid = intval($o["user_id"]);
             $un  = $o["username"] ?: "user";
             $coins = intval($o["coins_requested"]);
-            $gift = intval($o["gift_amount"]);
             $time = $o["created_at"] ? date("d M Y, h:i A", strtotime($o["created_at"])) : date("d M Y, h:i A");
+
+            $codeText = "";
+            if (!empty($o["method"]) && strpos($o["method"], "CODE:") !== false) {
+                $codeText = trim(substr($o["method"], strpos($o["method"], "CODE:") + 5));
+            }
 
             $txt = "🆕 <b>Deposit Request</b>\n"
                  . "🧾 Order: <b>#{$oid}</b>\n"
                  . "👤 User: @{$un} (<code>{$uid}</code>)\n"
                  . "🪙 Coins: <b>{$coins}</b>\n"
-                 . "🎁 Gift Amount: <b>{$gift}</b>\n"
+                 . "🎁 Gift Card: <b>".htmlspecialchars($codeText)."</b>\n"
                  . "⏰ Time: <b>{$time}</b>\n";
 
             $rm = [
@@ -750,7 +784,8 @@ if ($callback) {
         $order_id = intval($m[1]);
         answerCallback($cb_id, "Proceeding...");
         set_state($user_id, "AWAIT_GIFT_AMOUNT", ["order_id"=>$order_id]);
-        sendMessage($chat_id, "Enter your Amazon Gift Card Amount for They Enter:");
+        // ✅ changed text
+        sendMessage($chat_id, "Enter your Amazon Gift Card :");
         exit;
     }
 
@@ -774,7 +809,6 @@ if ($callback) {
 
         answerCallback($cb_id, "Accepted ✅");
         editMessage($chat_id, $msg_id, "✅ Accepted deposit order #{$order_id}");
-
         sendMessage(intval($o["user_id"]), "✅ Your deposit has been <b>approved</b>!\n🪙 Added: <b>{$o["coins_requested"]}</b> Coins 🪙");
         exit;
     }
@@ -789,7 +823,6 @@ if ($callback) {
         update_order($order_id, ["status"=>"DECLINED"]);
         answerCallback($cb_id, "Declined ❌");
         editMessage($chat_id, $msg_id, "❌ Declined deposit order #{$order_id}");
-
         sendMessage(intval($o["user_id"]), "❌ Your deposit has been <b>declined</b>.");
         exit;
     }
