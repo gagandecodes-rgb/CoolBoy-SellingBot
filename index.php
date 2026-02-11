@@ -9,10 +9,12 @@
 // ✅ Admin can Accept/Decline deposits (Amazon + UPI)
 // ✅ Admin Panel: Update UPI QR
 //
+// ✅ ADDED (FULL):
+// ✅ Buy Coupon workflow (show types + price + stock -> ask qty -> confirm/cancel -> deduct coins -> send codes -> save order)
+//
 // IMPORTANT NOTE (DB):
 // - Uses users.diamonds column as "coins" (no SQL change needed)
-// - If your orders.gift_amount is INT, we DO NOT store text there.
-//   Gift card code + UPI payer name stored inside orders.method string.
+// - Gift card code + UPI payer name stored inside orders.method string.
 // ===============================
 
 // ------------------- CONFIG -------------------
@@ -458,6 +460,84 @@ if ($message) {
         exit;
     }
 
+    // ===================== BUY COUPON WORKFLOW (FULL) =====================
+    if ($text === "🛒 Buy Coupon") {
+        clear_state($user_id);
+
+        $types = [500,1000,2000,4000];
+        $out = "🛒 <b>Select a coupon type:</b>\n\n";
+        foreach ($types as $c) {
+            $price = get_price($c);
+            $stock = stock_count($c);
+            $label = ($c==1000 ? "1K" : ($c==2000 ? "2K" : ($c==4000 ? "4K" : "500")));
+            $out .= "• <b>{$label}</b> (🪙 <b>{$price}</b> coins) | Stock: <b>{$stock}</b>\n";
+        }
+
+        $rm = ["inline_keyboard"=>[
+            [["text"=>"Buy 500", "callback_data"=>"buy:500"], ["text"=>"Buy 1K", "callback_data"=>"buy:1000"]],
+            [["text"=>"Buy 2K", "callback_data"=>"buy:2000"], ["text"=>"Buy 4K", "callback_data"=>"buy:4000"]],
+        ]];
+
+        sendMessage($chat_id, $out, $rm);
+        exit;
+    }
+
+    // Ask qty -> validate -> show confirm screen
+    if ($state === "AWAIT_BUY_QTY" && $text !== null) {
+        if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Please send a valid quantity number."); exit; }
+        $qty = intval($text);
+        if ($qty <= 0) { sendMessage($chat_id, "❌ Quantity must be 1 or more. Send again:"); exit; }
+
+        $ctype = intval($data["ctype"] ?? 0);
+        if (!in_array($ctype, [500,1000,2000,4000], true)) {
+            clear_state($user_id);
+            sendMessage($chat_id, "❌ Invalid type. Please try again.", main_menu($is_admin));
+            exit;
+        }
+
+        $available = stock_count($ctype);
+        if ($available < $qty) {
+            clear_state($user_id);
+            sendMessage($chat_id, "❌ Not enough stock! Available: <b>{$available}</b>", main_menu($is_admin));
+            exit;
+        }
+
+        $price = get_price($ctype);
+        $need = $price * $qty;
+        $bal = get_user_coins($user_id);
+
+        if ($bal < $need) {
+            clear_state($user_id);
+            sendMessage($chat_id, "❌ Not enough coins!\nNeeded: <b>{$need}</b> | You have: <b>{$bal}</b>", main_menu($is_admin));
+            exit;
+        }
+
+        $time = date("d M Y, h:i A");
+        $summary = "📝 <b>Order Summary</b>\n━━━━━━━━━━━━━━━\n".
+                   "🎟️ Type: <b>{$ctype}</b>\n".
+                   "📦 Qty: <b>{$qty}</b>\n".
+                   "🪙 Total Cost: <b>{$need}</b> coins\n".
+                   "💰 Your Balance: <b>{$bal}</b>\n".
+                   "📅 Time: <b>{$time}</b>\n".
+                   "━━━━━━━━━━━━━━━\n\nConfirm purchase?";
+
+        set_state($user_id, "AWAIT_BUY_CONFIRM", [
+            "ctype"=>$ctype,
+            "qty"=>$qty,
+            "need"=>$need
+        ]);
+
+        $rm = ["inline_keyboard"=>[
+            [
+                ["text"=>"✅ Confirm", "callback_data"=>"buy_ok"],
+                ["text"=>"❌ Cancel", "callback_data"=>"buy_cancel"]
+            ]
+        ]];
+
+        sendMessage($chat_id, $summary, $rm);
+        exit;
+    }
+
     // ===== Amazon flow =====
     if ($state === "AWAIT_AMAZON_COINS" && $text !== null) {
         if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Send a valid number (minimum 30)."); exit; }
@@ -490,7 +570,7 @@ if ($message) {
     if ($state === "AWAIT_GIFT_CODE" && $text !== null) {
         $gift_code = trim($text);
         if ($gift_code === "") {
-            sendMessage($chat_id, "❌ Please enter your Amazon Gift Card :");
+            sendMessage($chat_id, "❌ Enter your Amazon Gift Card :");
             exit;
         }
 
@@ -580,7 +660,6 @@ if ($message) {
         $order_id = intval($data["order_id"] ?? 0);
         if ($order_id <= 0) { clear_state($user_id); sendMessage($chat_id, "❌ Order missing. Start again."); exit; }
 
-        // store payer name inside method
         $o = get_order($order_id);
         if (!$o) { clear_state($user_id); sendMessage($chat_id, "❌ Order not found."); exit; }
 
@@ -841,12 +920,84 @@ if ($callback) {
         exit;
     }
 
-    // Buy coupon type
+    // ===================== BUY COUPON CALLBACKS =====================
     if (preg_match('/^buy:(500|1000|2000|4000)$/', $data, $m)) {
         $ctype = intval($m[1]);
         answerCallback($cb_id, "Selected $ctype");
         set_state($user_id, "AWAIT_BUY_QTY", ["ctype"=>$ctype]);
         sendMessage($chat_id, "How many {$ctype} coupons do you want to buy?\nPlease send the quantity:");
+        exit;
+    }
+
+    if ($data === "buy_cancel") {
+        answerCallback($cb_id, "Cancelled");
+        clear_state($user_id);
+        editMessage($chat_id, $msg_id, "❌ Purchase cancelled.");
+        exit;
+    }
+
+    if ($data === "buy_ok") {
+        answerCallback($cb_id, "Processing...");
+        $st = get_state($user_id);
+        if ($st["state"] !== "AWAIT_BUY_CONFIRM") {
+            answerCallback($cb_id, "No pending purchase.", true);
+            exit;
+        }
+
+        $ctype = intval($st["data"]["ctype"] ?? 0);
+        $qty   = intval($st["data"]["qty"] ?? 0);
+        $need  = intval($st["data"]["need"] ?? 0);
+
+        if (!in_array($ctype, [500,1000,2000,4000], true) || $qty<=0 || $need<=0) {
+            clear_state($user_id);
+            answerCallback($cb_id, "Invalid purchase.", true);
+            exit;
+        }
+
+        $available = stock_count($ctype);
+        if ($available < $qty) {
+            clear_state($user_id);
+            editMessage($chat_id, $msg_id, "❌ Not enough stock! Available: <b>{$available}</b>");
+            exit;
+        }
+
+        $bal = get_user_coins($user_id);
+        if ($bal < $need) {
+            clear_state($user_id);
+            editMessage($chat_id, $msg_id, "❌ Not enough coins!\nNeeded: <b>{$need}</b> | You have: <b>{$bal}</b>");
+            exit;
+        }
+
+        $codes = take_coupons($ctype, $qty, $user_id);
+        if (!$codes) {
+            clear_state($user_id);
+            editMessage($chat_id, $msg_id, "❌ Stock error. Try again.");
+            exit;
+        }
+
+        // deduct coins (negative)
+        add_user_coins($user_id, -$need);
+
+        $codesText = implode("\n", $codes);
+        $order_id = create_order($user_id, "COUPON", "COMPLETED", [
+            "ctype"=>$ctype,
+            "qty"=>$qty,
+            "total_cost"=>$need,
+            "codes_text"=>$codesText
+        ]);
+
+        clear_state($user_id);
+
+        editMessage(
+            $chat_id,
+            $msg_id,
+            "✅ <b>Purchase Successful</b>\n".
+            "🧾 Order: <b>#{$order_id}</b>\n".
+            "🎟️ Type: <b>{$ctype}</b>\n".
+            "📦 Qty: <b>{$qty}</b>\n".
+            "🪙 Cost: <b>{$need}</b> coins\n\n".
+            "🔑 <b>Your Codes:</b>\n<code>{$codesText}</code>"
+        );
         exit;
     }
 
