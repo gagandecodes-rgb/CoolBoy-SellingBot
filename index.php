@@ -3,22 +3,22 @@
 // ✅ SINGLE index.php (Webhook)
 // ✅ Selling Bot (COINS + Coupons)
 // ✅ Supabase Postgres via PDO
+// ✅ Deposit Methods: Amazon Gift Card + UPI
+// ✅ UPI flow uses Admin-uploaded QR (file_id stored in DB)
 // ✅ Admin Orders List (pending deposits)
-// ✅ Gift card input accepts ANY text (no numeric validation)
-// ✅ "Enter your Amazon Gift Card :" text
-// ✅ MINIMUM coins to add = 30
+// ✅ Admin can Accept/Decline deposits (Amazon + UPI)
+// ✅ Admin Panel: Update UPI QR
 //
 // IMPORTANT NOTE (DB):
-// Your SQL earlier had orders.gift_amount as INT.
-// To keep this script working WITHOUT changing SQL,
-// we store gift card CODE/TEXT inside orders.method as:
-// "AMAZON | CODE: <text>"
+// - Uses users.diamonds column as "coins" (no SQL change needed)
+// - If your orders.gift_amount is INT, we DO NOT store text there.
+//   Gift card code + UPI payer name stored inside orders.method string.
 // ===============================
 
 // ------------------- CONFIG -------------------
 $BOT_TOKEN = getenv("BOT_TOKEN");
 $ADMIN_IDS = array_filter(array_map('trim', explode(',', getenv("ADMIN_IDS") ?: "")));
-$DB_URL = getenv("DATABASE_URL"); // Supabase Postgres URL
+$DB_URL = getenv("DATABASE_URL");
 
 if (!$BOT_TOKEN) die("BOT_TOKEN missing");
 if (!$DB_URL) die("DATABASE_URL missing");
@@ -69,6 +69,17 @@ function sendMessage($chat_id, $text, $reply_markup = null, $parse_mode = "HTML"
     return tg("sendMessage", $payload);
 }
 
+function sendPhotoMsg($chat_id, $file_id, $caption, $reply_markup = null, $parse_mode = "HTML") {
+    $payload = [
+        "chat_id"=>$chat_id,
+        "photo"=>$file_id,
+        "caption"=>$caption,
+        "parse_mode"=>$parse_mode
+    ];
+    if ($reply_markup) $payload["reply_markup"] = $reply_markup;
+    return tg("sendPhoto", $payload);
+}
+
 function editMessage($chat_id, $message_id, $text, $reply_markup = null, $parse_mode="HTML") {
     $payload = [
         "chat_id"=>$chat_id,
@@ -94,6 +105,34 @@ function isAdmin($user_id) {
     return in_array(strval($user_id), $ADMIN_IDS, true);
 }
 
+function esc($s) { return htmlspecialchars((string)$s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
+
+// ------------------- BOT SETTINGS TABLE (QR storage) -------------------
+function init_settings_table() {
+    global $pdo;
+    $pdo->prepare("CREATE TABLE IF NOT EXISTS bot_settings (
+        skey TEXT PRIMARY KEY,
+        svalue TEXT
+    )")->execute();
+}
+function set_setting($key, $val) {
+    global $pdo;
+    init_settings_table();
+    $stmt = $pdo->prepare("
+      INSERT INTO bot_settings(skey, svalue) VALUES(:k,:v)
+      ON CONFLICT(skey) DO UPDATE SET svalue=EXCLUDED.svalue
+    ");
+    $stmt->execute([":k"=>$key, ":v"=>$val]);
+}
+function get_setting($key) {
+    global $pdo;
+    init_settings_table();
+    $stmt = $pdo->prepare("SELECT svalue FROM bot_settings WHERE skey=:k");
+    $stmt->execute([":k"=>$key]);
+    $v = $stmt->fetchColumn();
+    return $v !== false ? $v : null;
+}
+
 // ------------------- USER STATE (DB) -------------------
 function init_states_table() {
     global $pdo;
@@ -104,7 +143,6 @@ function init_states_table() {
         updated_at TIMESTAMPTZ DEFAULT NOW()
     )")->execute();
 }
-
 function set_state($user_id, $state, $data = []) {
     global $pdo;
     init_states_table();
@@ -119,7 +157,6 @@ function set_state($user_id, $state, $data = []) {
         ":dt"=>json_encode($data)
     ]);
 }
-
 function get_state($user_id) {
     global $pdo;
     init_states_table();
@@ -129,11 +166,10 @@ function get_state($user_id) {
     if (!$row) return ["state"=>null, "data"=>[]];
     return ["state"=>$row["state"], "data"=>$row["data"] ? json_decode($row["data"], true) : []];
 }
-
 function clear_state($user_id) { set_state($user_id, null, []); }
 
 // ------------------- DB BUSINESS -------------------
-// NOTE: uses users.diamonds column as "coins" (no SQL change needed)
+// NOTE: uses users.diamonds column as "coins"
 function ensure_user($user_id, $username) {
     global $pdo;
     $stmt = $pdo->prepare("
@@ -143,7 +179,6 @@ function ensure_user($user_id, $username) {
     ");
     $stmt->execute([":uid"=>$user_id, ":un"=>$username]);
 }
-
 function get_user_coins($user_id) {
     global $pdo;
     $stmt = $pdo->prepare("SELECT diamonds FROM users WHERE user_id=:uid");
@@ -151,7 +186,6 @@ function get_user_coins($user_id) {
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
     return $row ? intval($row["diamonds"]) : 0;
 }
-
 function add_user_coins($user_id, $amount) {
     global $pdo;
     $stmt = $pdo->prepare("UPDATE users SET diamonds = diamonds + :a WHERE user_id=:uid");
@@ -163,9 +197,8 @@ function get_price($ctype) {
     $stmt = $pdo->prepare("SELECT price FROM coupon_prices WHERE ctype=:c");
     $stmt->execute([":c"=>$ctype]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
-    return $row ? intval($row["price"]) : null;
+    return $row ? intval($row["price"]) : 0;
 }
-
 function set_price($ctype, $price) {
     global $pdo;
     $stmt = $pdo->prepare("
@@ -182,7 +215,6 @@ function stock_count($ctype) {
     $stmt->execute([":c"=>$ctype]);
     return intval($stmt->fetch(PDO::FETCH_ASSOC)["c"] ?? 0);
 }
-
 function add_coupons($ctype, $codes) {
     global $pdo;
     $ins = $pdo->prepare("INSERT INTO coupon_codes(ctype, code, is_used) VALUES(:c, :code, false) ON CONFLICT (code) DO NOTHING");
@@ -195,7 +227,6 @@ function add_coupons($ctype, $codes) {
     }
     return $added;
 }
-
 function remove_coupons($ctype, $qty) {
     global $pdo;
     $stmt = $pdo->prepare("
@@ -212,7 +243,6 @@ function remove_coupons($ctype, $qty) {
     $stmt->execute();
     return $stmt->rowCount();
 }
-
 function take_coupons($ctype, $qty, $user_id) {
     global $pdo;
     $pdo->beginTransaction();
@@ -271,7 +301,6 @@ function create_order($user_id, $otype, $status, $fields=[]) {
     $stmt->execute($params);
     return intval($stmt->fetchColumn());
 }
-
 function update_order($order_id, $fields=[]) {
     global $pdo;
     $sets = [];
@@ -285,14 +314,12 @@ function update_order($order_id, $fields=[]) {
     $stmt = $pdo->prepare($sql);
     $stmt->execute($params);
 }
-
 function get_order($order_id) {
     global $pdo;
     $stmt = $pdo->prepare("SELECT * FROM orders WHERE id=:id");
     $stmt->execute([":id"=>$order_id]);
     return $stmt->fetch(PDO::FETCH_ASSOC);
 }
-
 function list_user_orders($user_id, $limit=15) {
     global $pdo;
     $stmt = $pdo->prepare("SELECT * FROM orders WHERE user_id=:u ORDER BY id DESC LIMIT :l");
@@ -301,7 +328,6 @@ function list_user_orders($user_id, $limit=15) {
     $stmt->execute();
     return $stmt->fetchAll(PDO::FETCH_ASSOC);
 }
-
 function list_pending_deposits($limit = 25) {
     global $pdo;
     $stmt = $pdo->prepare("
@@ -332,8 +358,9 @@ function main_menu($is_admin=false) {
 function admin_menu() {
     $rows = [
         [newBtn("📦 Stock"), newBtn("💰 Change Prices")],
-        [newBtn("📋 Orders List"), newBtn("🎁 Get Free Code")],
-        [newBtn("➕ Add Coupon"), newBtn("➖ Remove Coupon")],
+        [newBtn("📋 Orders List"), newBtn("🧾 Update UPI QR")],
+        [newBtn("🎁 Get Free Code"), newBtn("➕ Add Coupon")],
+        [newBtn("➖ Remove Coupon")],
         [newBtn("⬅️ Back")]
     ];
     return ["keyboard"=>$rows, "resize_keyboard"=>true];
@@ -410,14 +437,20 @@ if ($message) {
         exit;
     }
 
-    // ---------------- Add Coins ----------------
+    // ---------------- Add Coins (payment methods) ----------------
     if ($text === "➕ Add Coins") {
         clear_state($user_id);
-        $msg = "💳 <b>Select Payment Method:</b>\n\n⚠️ <b>Under Maintenance:</b>\n🛠️ UPI Payment\n\nPlease use other methods for deposit.";
+
+        $msg = "💳 <b>Select Payment Method:</b>\n\n".
+               "⚠️ <b>Under Maintenance:</b>\n".
+               "🛠️ PhonePe Gift Card\n\n".
+               "Please use other methods for deposit.";
+
         $rm = [
             "inline_keyboard" => [
                 [
-                    ["text"=>"🎁 Amazon Gift Card", "callback_data"=>"pay:amazon"]
+                    ["text"=>"🎁 Amazon Gift Card", "callback_data"=>"pay:amazon"],
+                    ["text"=>"🏦 UPI", "callback_data"=>"pay:upi"]
                 ]
             ]
         ];
@@ -425,7 +458,7 @@ if ($message) {
         exit;
     }
 
-    // User enters coins (✅ minimum 30)
+    // ===== Amazon flow =====
     if ($state === "AWAIT_AMAZON_COINS" && $text !== null) {
         if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Send a valid number (minimum 30)."); exit; }
         $coins = intval($text);
@@ -445,19 +478,16 @@ if ($message) {
                    "📅 Time: <b>{$time}</b>\n".
                    "━━━━━━━━━━━━━━━\n\nClick below to proceed.";
 
-        $rm = [
-            "inline_keyboard" => [
-                [["text"=>"✅ Submit Gift Card", "callback_data"=>"deposit_submit:$order_id"]]
-            ]
-        ];
+        $rm = ["inline_keyboard" => [
+            [["text"=>"✅ Submit Gift Card", "callback_data"=>"deposit_submit:$order_id"]]
+        ]];
 
         clear_state($user_id);
         sendMessage($chat_id, $summary, $rm);
         exit;
     }
 
-    // ✅ Gift card input: ANY TEXT
-    if ($state === "AWAIT_GIFT_AMOUNT" && $text !== null) {
+    if ($state === "AWAIT_GIFT_CODE" && $text !== null) {
         $gift_code = trim($text);
         if ($gift_code === "") {
             sendMessage($chat_id, "❌ Please enter your Amazon Gift Card :");
@@ -465,22 +495,15 @@ if ($message) {
         }
 
         $order_id = intval($data["order_id"] ?? 0);
-        if ($order_id <= 0) {
-            clear_state($user_id);
-            sendMessage($chat_id, "❌ Order missing. Start again.");
-            exit;
-        }
+        if ($order_id <= 0) { clear_state($user_id); sendMessage($chat_id, "❌ Order missing. Start again."); exit; }
 
-        $new_method = "AMAZON | CODE: " . $gift_code;
-        update_order($order_id, ["method"=>$new_method, "status"=>"PENDING"]);
-
-        set_state($user_id, "AWAIT_GIFT_PHOTO", ["order_id"=>$order_id]);
+        update_order($order_id, ["method"=>"AMAZON | CODE: ".$gift_code, "status"=>"PENDING"]);
+        set_state($user_id, "AWAIT_AMAZON_PHOTO", ["order_id"=>$order_id]);
         sendMessage($chat_id, "📸 Now upload a screenshot of the gift card:");
         exit;
     }
 
-    // User uploads screenshot
-    if ($state === "AWAIT_GIFT_PHOTO" && $photo) {
+    if ($state === "AWAIT_AMAZON_PHOTO" && $photo) {
         $order_id = intval($data["order_id"] ?? 0);
         if ($order_id <= 0) { clear_state($user_id); sendMessage($chat_id, "❌ Order missing. Start again."); exit; }
 
@@ -488,140 +511,152 @@ if ($message) {
         update_order($order_id, ["photo_file_id"=>$file_id, "status"=>"AWAITING_ADMIN"]);
         clear_state($user_id);
 
-        sendMessage($chat_id, "✅ Admin is checking your code.\n⏳ Please wait for approval.");
+        sendMessage($chat_id, "✅ Admin is checking your payment.\n⏳ Please wait for approval.");
 
         $o = get_order($order_id);
         $time = date("d M Y, h:i A", strtotime($o["created_at"]));
-
         $codeText = "";
         if (!empty($o["method"]) && strpos($o["method"], "CODE:") !== false) {
             $codeText = trim(substr($o["method"], strpos($o["method"], "CODE:") + 5));
         }
 
-        $adminText = "🆕 <b>Deposit Request</b>\n".
+        $adminText = "🆕 <b>Deposit Request (Amazon)</b>\n".
                      "🧾 Order: <b>#{$order_id}</b>\n".
                      "👤 User: @{$username} (<code>{$user_id}</code>)\n".
                      "🪙 Coins: <b>{$o["coins_requested"]}</b>\n".
-                     "🎁 Gift Card: <b>".htmlspecialchars($codeText)."</b>\n".
+                     "🎁 Gift Card: <b>".esc($codeText)."</b>\n".
                      "⏰ Time: <b>{$time}</b>\n";
 
-        $adminRm = [
-            "inline_keyboard" => [
-                [
-                    ["text"=>"✅ Accept", "callback_data"=>"admin_dep_ok:$order_id"],
-                    ["text"=>"❌ Decline", "callback_data"=>"admin_dep_no:$order_id"]
-                ]
-            ]
-        ];
+        $adminRm = ["inline_keyboard" => [[
+            ["text"=>"✅ Accept", "callback_data"=>"admin_dep_ok:$order_id"],
+            ["text"=>"❌ Decline", "callback_data"=>"admin_dep_no:$order_id"]
+        ]]];
 
         foreach ($GLOBALS["ADMIN_IDS"] as $aid) {
-            tg("sendPhoto", [
-                "chat_id" => intval($aid),
-                "photo" => $file_id,
-                "caption" => $adminText,
-                "parse_mode" => "HTML",
-                "reply_markup" => $adminRm
-            ]);
+            sendPhotoMsg(intval($aid), $file_id, $adminText, $adminRm);
         }
         exit;
     }
 
-    // ---------------- Buy Coupon ----------------
-    if ($text === "🛒 Buy Coupon") {
-        clear_state($user_id);
+    // ===== UPI flow =====
+    if ($state === "AWAIT_UPI_COINS" && $text !== null) {
+        if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Send a valid number (minimum 30)."); exit; }
+        $coins = intval($text);
+        if ($coins < 30) { sendMessage($chat_id, "❌ Minimum is 30 coins. Send again:"); exit; }
 
-        $types = [500,1000,2000,4000];
-        $lines = "🛒 <b>Select a coupon type:</b>\n\n";
-        foreach ($types as $c) {
-            $p = get_price($c);
-            $s = stock_count($c);
-            $label = ($c==1000 ? "1K" : ($c==2000 ? "2K" : ($c==4000 ? "4K" : "500")));
-            $lines .= "• <b>{$label}</b> (🪙 {$p} coins) | Stock: <b>{$s}</b>\n";
-        }
-
-        $rm = ["inline_keyboard"=>[
-            [["text"=>"500", "callback_data"=>"buy:500"], ["text"=>"1K", "callback_data"=>"buy:1000"]],
-            [["text"=>"2K", "callback_data"=>"buy:2000"], ["text"=>"4K", "callback_data"=>"buy:4000"]],
-        ]];
-
-        sendMessage($chat_id, $lines, $rm);
-        exit;
-    }
-
-    if ($state === "AWAIT_BUY_QTY" && $text !== null) {
-        if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Send a valid quantity number."); exit; }
-        $qty = intval($text);
-        if ($qty <= 0) { sendMessage($chat_id, "❌ Quantity must be 1 or more."); exit; }
-
-        $ctype = intval($data["ctype"] ?? 0);
-        if (!in_array($ctype, [500,1000,2000,4000], true)) { clear_state($user_id); sendMessage($chat_id, "❌ Invalid type. Start again."); exit; }
-
-        $available = stock_count($ctype);
-        if ($available < $qty) {
+        $qr_file_id = get_setting("upi_qr_file_id");
+        if (!$qr_file_id) {
             clear_state($user_id);
-            sendMessage($chat_id, "❌ Not enough stock! Available: {$available}", main_menu($is_admin));
+            sendMessage($chat_id, "❌ UPI QR is not set yet. Please contact admin.");
             exit;
         }
 
-        $price = get_price($ctype);
-        $need = $price * $qty;
-        $bal = get_user_coins($user_id);
-        if ($bal < $need) {
-            clear_state($user_id);
-            sendMessage($chat_id, "❌ Not enough coins!\nNeeded: {$need} | You have: {$bal}", main_menu($is_admin));
-            exit;
-        }
-
-        $codes = take_coupons($ctype, $qty, $user_id);
-        if (!$codes) {
-            clear_state($user_id);
-            sendMessage($chat_id, "❌ Not enough stock! Available: ".stock_count($ctype), main_menu($is_admin));
-            exit;
-        }
-
-        add_user_coins($user_id, -$need);
-
-        $codesText = implode("\n", $codes);
-        $order_id = create_order($user_id, "COUPON", "COMPLETED", [
-            "ctype"=>$ctype,
-            "qty"=>$qty,
-            "total_cost"=>$need,
-            "codes_text"=>$codesText
+        $order_id = create_order($user_id, "DEPOSIT", "PENDING", [
+            "method" => "UPI",
+            "coins_requested" => $coins
         ]);
 
         clear_state($user_id);
-        sendMessage($chat_id,
-            "✅ <b>Purchase Successful</b>\n".
-            "🧾 Order: <b>#{$order_id}</b>\n".
-            "🎟️ Type: <b>{$ctype}</b>\n".
-            "📦 Qty: <b>{$qty}</b>\n".
-            "🪙 Cost: <b>{$need}</b> coins\n\n".
-            "🔑 <b>Your Codes:</b>\n<code>{$codesText}</code>",
-            main_menu($is_admin)
-        );
+
+        $caption = "💳<b>Payement Request</b>\n\n".
+                   "🎫Order- <b>#{$order_id}</b>\n".
+                   "💰Amount- <b>{$coins}</b>\n\n".
+                   "✅ After payment, click \"I Have Paid\" below";
+
+        $rm = ["inline_keyboard" => [
+            [["text"=>"✅ I Have Paid", "callback_data"=>"upi_paid:$order_id"]]
+        ]];
+
+        sendPhotoMsg($chat_id, $qr_file_id, $caption, $rm);
+        exit;
+    }
+
+    if ($state === "AWAIT_UPI_PAYER_NAME" && $text !== null) {
+        $payer = trim($text);
+        if ($payer === "") {
+            sendMessage($chat_id, "❌ Please send payer name:");
+            exit;
+        }
+        $order_id = intval($data["order_id"] ?? 0);
+        if ($order_id <= 0) { clear_state($user_id); sendMessage($chat_id, "❌ Order missing. Start again."); exit; }
+
+        // store payer name inside method
+        $o = get_order($order_id);
+        if (!$o) { clear_state($user_id); sendMessage($chat_id, "❌ Order not found."); exit; }
+
+        update_order($order_id, ["method"=>"UPI | NAME: ".$payer, "status"=>"PENDING"]);
+        set_state($user_id, "AWAIT_UPI_SS", ["order_id"=>$order_id]);
+
+        sendMessage($chat_id, "📸 Now upload a screenshot of payment:");
+        exit;
+    }
+
+    if ($state === "AWAIT_UPI_SS" && $photo) {
+        $order_id = intval($data["order_id"] ?? 0);
+        if ($order_id <= 0) { clear_state($user_id); sendMessage($chat_id, "❌ Order missing. Start again."); exit; }
+
+        $file_id = end($photo)["file_id"];
+        update_order($order_id, ["photo_file_id"=>$file_id, "status"=>"AWAITING_ADMIN"]);
+        clear_state($user_id);
+
+        sendMessage($chat_id, "✅ Admin is reviewing your payment.\n⏳ Please wait for approval.");
+
+        $o = get_order($order_id);
+        $time = date("d M Y, h:i A", strtotime($o["created_at"]));
+
+        $payerName = "";
+        if (!empty($o["method"]) && strpos($o["method"], "NAME:") !== false) {
+            $payerName = trim(substr($o["method"], strpos($o["method"], "NAME:") + 5));
+        }
+
+        $adminText = "🆕 <b>Deposit Request (UPI)</b>\n".
+                     "🧾 Order: <b>#{$order_id}</b>\n".
+                     "👤 User: @{$username} (<code>{$user_id}</code>)\n".
+                     "🪙 Coins: <b>{$o["coins_requested"]}</b>\n".
+                     "👤 Payer: <b>".esc($payerName)."</b>\n".
+                     "⏰ Time: <b>{$time}</b>\n";
+
+        $adminRm = ["inline_keyboard" => [[
+            ["text"=>"✅ Accept", "callback_data"=>"admin_dep_ok:$order_id"],
+            ["text"=>"❌ Decline", "callback_data"=>"admin_dep_no:$order_id"]
+        ]]];
+
+        foreach ($GLOBALS["ADMIN_IDS"] as $aid) {
+            sendPhotoMsg(intval($aid), $file_id, $adminText, $adminRm);
+        }
         exit;
     }
 
     // ================= ADMIN =================
+    if ($text === "🧾 Update UPI QR") {
+        if (!$is_admin) { sendMessage($chat_id, "❌ Admin only."); exit; }
+        set_state($user_id, "ADMIN_AWAIT_UPI_QR", []);
+        sendMessage($chat_id, "📸 Send the new UPI QR image now:");
+        exit;
+    }
+
+    if ($state === "ADMIN_AWAIT_UPI_QR" && $photo) {
+        if (!$is_admin) { clear_state($user_id); exit; }
+        $file_id = end($photo)["file_id"];
+        set_setting("upi_qr_file_id", $file_id);
+        clear_state($user_id);
+        sendMessage($chat_id, "✅ UPI QR updated successfully.", admin_menu());
+        exit;
+    }
+
     if ($text === "📦 Stock") {
         if (!$is_admin) { sendMessage($chat_id, "❌ Admin only."); exit; }
         $types = [500,1000,2000,4000];
         $out = "📦 <b>Stock</b>\n━━━━━━━━━━━━━━━\n";
-        foreach($types as $c){
-            $out .= "• {$c}: <b>".stock_count($c)."</b>\n";
-        }
+        foreach($types as $c){ $out .= "• {$c}: <b>".stock_count($c)."</b>\n"; }
         sendMessage($chat_id, $out, admin_menu());
         exit;
     }
 
     if ($text === "📋 Orders List") {
         if (!$is_admin) { sendMessage($chat_id, "❌ Admin only."); exit; }
-
         $pending = list_pending_deposits(25);
-        if (!$pending) {
-            sendMessage($chat_id, "✅ No pending deposits right now.", admin_menu());
-            exit;
-        }
+        if (!$pending) { sendMessage($chat_id, "✅ No pending deposits right now.", admin_menu()); exit; }
 
         sendMessage($chat_id, "📋 <b>Pending Deposits:</b>\nShowing latest pending requests:", admin_menu());
 
@@ -632,35 +667,31 @@ if ($message) {
             $coins = intval($o["coins_requested"]);
             $time = $o["created_at"] ? date("d M Y, h:i A", strtotime($o["created_at"])) : date("d M Y, h:i A");
 
-            $codeText = "";
-            if (!empty($o["method"]) && strpos($o["method"], "CODE:") !== false) {
-                $codeText = trim(substr($o["method"], strpos($o["method"], "CODE:") + 5));
+            $extra = "";
+            if (!empty($o["method"])) {
+                if (strpos($o["method"], "AMAZON") === 0 && strpos($o["method"], "CODE:") !== false) {
+                    $codeText = trim(substr($o["method"], strpos($o["method"], "CODE:") + 5));
+                    $extra = "🎁 Gift Card: <b>".esc($codeText)."</b>\n";
+                } elseif (strpos($o["method"], "UPI") === 0 && strpos($o["method"], "NAME:") !== false) {
+                    $payer = trim(substr($o["method"], strpos($o["method"], "NAME:") + 5));
+                    $extra = "👤 Payer: <b>".esc($payer)."</b>\n";
+                }
             }
 
             $txt = "🆕 <b>Deposit Request</b>\n"
                  . "🧾 Order: <b>#{$oid}</b>\n"
                  . "👤 User: @{$un} (<code>{$uid}</code>)\n"
                  . "🪙 Coins: <b>{$coins}</b>\n"
-                 . "🎁 Gift Card: <b>".htmlspecialchars($codeText)."</b>\n"
+                 . $extra
                  . "⏰ Time: <b>{$time}</b>\n";
 
-            $rm = [
-                "inline_keyboard" => [
-                    [
-                        ["text"=>"✅ Accept", "callback_data"=>"admin_dep_ok:$oid"],
-                        ["text"=>"❌ Decline", "callback_data"=>"admin_dep_no:$oid"]
-                    ]
-                ]
-            ];
+            $rm = ["inline_keyboard" => [[
+                ["text"=>"✅ Accept", "callback_data"=>"admin_dep_ok:$oid"],
+                ["text"=>"❌ Decline", "callback_data"=>"admin_dep_no:$oid"]
+            ]]];
 
             if (!empty($o["photo_file_id"])) {
-                tg("sendPhoto", [
-                    "chat_id" => $chat_id,
-                    "photo" => $o["photo_file_id"],
-                    "caption" => $txt,
-                    "parse_mode" => "HTML",
-                    "reply_markup" => $rm
-                ]);
+                sendPhotoMsg($chat_id, $o["photo_file_id"], $txt, $rm);
             } else {
                 sendMessage($chat_id, $txt, $rm);
             }
@@ -744,8 +775,9 @@ if ($message) {
         exit;
     }
 
-    if ($photo && $state !== "AWAIT_GIFT_PHOTO") {
-        sendMessage($chat_id, "❌ Please use menu buttons. (Photo not expected now)", main_menu($is_admin));
+    // If photo sent unexpectedly
+    if ($photo && !in_array($state, ["AWAIT_AMAZON_PHOTO","AWAIT_UPI_SS","ADMIN_AWAIT_UPI_QR"], true)) {
+        sendMessage($chat_id, "❌ Photo not expected now. Use menu buttons.", main_menu($is_admin));
         exit;
     }
 
@@ -767,6 +799,7 @@ if ($callback) {
     ensure_user($user_id, $username);
     $is_admin = isAdmin($user_id);
 
+    // Payment method selection
     if ($data === "pay:amazon") {
         answerCallback($cb_id, "Amazon selected");
         set_state($user_id, "AWAIT_AMAZON_COINS", []);
@@ -774,14 +807,41 @@ if ($callback) {
         exit;
     }
 
+    if ($data === "pay:upi") {
+        answerCallback($cb_id, "UPI selected");
+        set_state($user_id, "AWAIT_UPI_COINS", []);
+        sendMessage($chat_id, "How much coins you need? (Minimum: 30)");
+        exit;
+    }
+
+    // Amazon submit -> ask gift card code (text)
     if (preg_match('/^deposit_submit:(\d+)$/', $data, $m)) {
         $order_id = intval($m[1]);
         answerCallback($cb_id, "Proceeding...");
-        set_state($user_id, "AWAIT_GIFT_AMOUNT", ["order_id"=>$order_id]);
+        set_state($user_id, "AWAIT_GIFT_CODE", ["order_id"=>$order_id]);
         sendMessage($chat_id, "Enter your Amazon Gift Card :");
         exit;
     }
 
+    // UPI "I Have Paid"
+    if (preg_match('/^upi_paid:(\d+)$/', $data, $m)) {
+        $order_id = intval($m[1]);
+        $o = get_order($order_id);
+        if (!$o || intval($o["user_id"]) !== intval($user_id)) {
+            answerCallback($cb_id, "Invalid order", true);
+            exit;
+        }
+        if ($o["status"] !== "PENDING") {
+            answerCallback($cb_id, "Already submitted", true);
+            exit;
+        }
+        answerCallback($cb_id, "OK");
+        set_state($user_id, "AWAIT_UPI_PAYER_NAME", ["order_id"=>$order_id]);
+        sendMessage($chat_id, "Send the payer name (person who paid):");
+        exit;
+    }
+
+    // Buy coupon type
     if (preg_match('/^buy:(500|1000|2000|4000)$/', $data, $m)) {
         $ctype = intval($m[1]);
         answerCallback($cb_id, "Selected $ctype");
@@ -790,6 +850,7 @@ if ($callback) {
         exit;
     }
 
+    // Admin accept deposit (works for Amazon + UPI)
     if (preg_match('/^admin_dep_ok:(\d+)$/', $data, $m)) {
         if (!$is_admin) { answerCallback($cb_id, "Admin only", true); exit; }
         $order_id = intval($m[1]);
@@ -806,6 +867,7 @@ if ($callback) {
         exit;
     }
 
+    // Admin decline deposit
     if (preg_match('/^admin_dep_no:(\d+)$/', $data, $m)) {
         if (!$is_admin) { answerCallback($cb_id, "Admin only", true); exit; }
         $order_id = intval($m[1]);
@@ -820,6 +882,7 @@ if ($callback) {
         exit;
     }
 
+    // Admin choose type for price
     if (preg_match('/^admin_price:(500|1000|2000|4000)$/', $data, $m)) {
         if (!$is_admin) { answerCallback($cb_id, "Admin only", true); exit; }
         $ctype = intval($m[1]);
@@ -829,6 +892,7 @@ if ($callback) {
         exit;
     }
 
+    // Admin get free code
     if (preg_match('/^admin_free:(500|1000|2000|4000)$/', $data, $m)) {
         if (!$is_admin) { answerCallback($cb_id, "Admin only", true); exit; }
         $ctype = intval($m[1]);
@@ -839,6 +903,7 @@ if ($callback) {
         exit;
     }
 
+    // Admin add coupon type
     if (preg_match('/^admin_add:(500|1000|2000|4000)$/', $data, $m)) {
         if (!$is_admin) { answerCallback($cb_id, "Admin only", true); exit; }
         $ctype = intval($m[1]);
@@ -848,6 +913,7 @@ if ($callback) {
         exit;
     }
 
+    // Admin remove coupon type
     if (preg_match('/^admin_rem:(500|1000|2000|4000)$/', $data, $m)) {
         if (!$is_admin) { answerCallback($cb_id, "Admin only", true); exit; }
         $ctype = intval($m[1]);
