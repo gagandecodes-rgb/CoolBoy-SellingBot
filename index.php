@@ -3,18 +3,13 @@
 // ✅ SINGLE index.php (Webhook)
 // ✅ Selling Bot (COINS + Coupons)
 // ✅ Supabase Postgres via PDO
-// ✅ Deposit Methods: Amazon Gift Card + UPI
-// ✅ UPI flow uses Admin-uploaded QR (file_id stored in DB)
-// ✅ Admin Orders List (pending deposits)
-// ✅ Admin can Accept/Decline deposits (Amazon + UPI)
-// ✅ Admin Panel: Update UPI QR
-//
-// ✅ ADDED (FULL):
+// ✅ Deposit Methods: Amazon Gift Card (✅ ENABLED) + UPI (🛠️ MAINTENANCE / DISABLED)
+// ✅ UPI flow is BLOCKED even if old buttons exist
 // ✅ Buy Coupon workflow (show types + price + stock -> ask qty -> confirm/cancel -> deduct coins -> send codes -> save order)
 //
 // IMPORTANT NOTE (DB):
 // - Uses users.diamonds column as "coins" (no SQL change needed)
-// - Gift card code + UPI payer name stored inside orders.method string.
+// - Gift card code stored inside orders.method string.
 // ===============================
 
 // ------------------- CONFIG -------------------
@@ -439,20 +434,24 @@ if ($message) {
         exit;
     }
 
-    // ---------------- Add Coins (payment methods) ----------------
+    // ---------------- Add Coins (ONLY AMAZON ENABLED) ----------------
     if ($text === "➕ Add Coins") {
         clear_state($user_id);
 
         $msg = "💳 <b>Select Payment Method:</b>\n\n".
-               "⚠️ <b>Under Maintenance:</b>\n".
+               "🛠️ <b>Under Maintenance:</b>\n".
+               "🏦 UPI\n".
                "🛠️ PhonePe Gift Card\n\n".
-               "Please use other methods for deposit.";
+               "✅ Please use <b>Amazon Gift Card</b> for deposit.";
 
+        // ✅ Only Amazon is real. UPI button is just maintenance (noop).
         $rm = [
             "inline_keyboard" => [
                 [
-                    ["text"=>"🎁 Amazon Gift Card", "callback_data"=>"pay:amazon"],
-                    ["text"=>"🏦 UPI", "callback_data"=>"pay:upi"]
+                    ["text"=>"🎁 Amazon Gift Card", "callback_data"=>"pay:amazon"]
+                ],
+                [
+                    ["text"=>"🏦 UPI (Maintenance)", "callback_data"=>"noop_upi_maintenance"]
                 ]
             ]
         ];
@@ -618,97 +617,18 @@ if ($message) {
         exit;
     }
 
-    // ===== UPI flow =====
-    if ($state === "AWAIT_UPI_COINS" && $text !== null) {
-        if (!preg_match('/^\d+$/', $text)) { sendMessage($chat_id, "❌ Send a valid number (minimum 30)."); exit; }
-        $coins = intval($text);
-        if ($coins < 30) { sendMessage($chat_id, "❌ Minimum is 30 coins. Send again:"); exit; }
-
-        $qr_file_id = get_setting("upi_qr_file_id");
-        if (!$qr_file_id) {
-            clear_state($user_id);
-            sendMessage($chat_id, "❌ UPI QR is not set yet. Please contact admin.");
-            exit;
-        }
-
-        $order_id = create_order($user_id, "DEPOSIT", "PENDING", [
-            "method" => "UPI",
-            "coins_requested" => $coins
-        ]);
-
+    // ===== UPI flow (DISABLED) =====
+    // If user somehow reaches UPI states, stop them.
+    if (in_array($state, ["AWAIT_UPI_COINS","AWAIT_UPI_PAYER_NAME","AWAIT_UPI_SS"], true)) {
         clear_state($user_id);
-
-        $caption = "💳<b>Payement Request</b>\n\n".
-                   "🎫Order- <b>#{$order_id}</b>\n".
-                   "💰Amount- <b>{$coins}</b>\n\n".
-                   "✅ After payment, click \"I Have Paid\" below";
-
-        $rm = ["inline_keyboard" => [
-            [["text"=>"✅ I Have Paid", "callback_data"=>"upi_paid:$order_id"]]
-        ]];
-
-        sendPhotoMsg($chat_id, $qr_file_id, $caption, $rm);
-        exit;
-    }
-
-    if ($state === "AWAIT_UPI_PAYER_NAME" && $text !== null) {
-        $payer = trim($text);
-        if ($payer === "") {
-            sendMessage($chat_id, "❌ Please send payer name:");
-            exit;
-        }
-        $order_id = intval($data["order_id"] ?? 0);
-        if ($order_id <= 0) { clear_state($user_id); sendMessage($chat_id, "❌ Order missing. Start again."); exit; }
-
-        $o = get_order($order_id);
-        if (!$o) { clear_state($user_id); sendMessage($chat_id, "❌ Order not found."); exit; }
-
-        update_order($order_id, ["method"=>"UPI | NAME: ".$payer, "status"=>"PENDING"]);
-        set_state($user_id, "AWAIT_UPI_SS", ["order_id"=>$order_id]);
-
-        sendMessage($chat_id, "📸 Now upload a screenshot of payment:");
-        exit;
-    }
-
-    if ($state === "AWAIT_UPI_SS" && $photo) {
-        $order_id = intval($data["order_id"] ?? 0);
-        if ($order_id <= 0) { clear_state($user_id); sendMessage($chat_id, "❌ Order missing. Start again."); exit; }
-
-        $file_id = end($photo)["file_id"];
-        update_order($order_id, ["photo_file_id"=>$file_id, "status"=>"AWAITING_ADMIN"]);
-        clear_state($user_id);
-
-        sendMessage($chat_id, "✅ Admin is reviewing your payment.\n⏳ Please wait for approval.");
-
-        $o = get_order($order_id);
-        $time = date("d M Y, h:i A", strtotime($o["created_at"]));
-
-        $payerName = "";
-        if (!empty($o["method"]) && strpos($o["method"], "NAME:") !== false) {
-            $payerName = trim(substr($o["method"], strpos($o["method"], "NAME:") + 5));
-        }
-
-        $adminText = "🆕 <b>Deposit Request (UPI)</b>\n".
-                     "🧾 Order: <b>#{$order_id}</b>\n".
-                     "👤 User: @{$username} (<code>{$user_id}</code>)\n".
-                     "🪙 Coins: <b>{$o["coins_requested"]}</b>\n".
-                     "👤 Payer: <b>".esc($payerName)."</b>\n".
-                     "⏰ Time: <b>{$time}</b>\n";
-
-        $adminRm = ["inline_keyboard" => [[
-            ["text"=>"✅ Accept", "callback_data"=>"admin_dep_ok:$order_id"],
-            ["text"=>"❌ Decline", "callback_data"=>"admin_dep_no:$order_id"]
-        ]]];
-
-        foreach ($GLOBALS["ADMIN_IDS"] as $aid) {
-            sendPhotoMsg(intval($aid), $file_id, $adminText, $adminRm);
-        }
+        sendMessage($chat_id, "🛠️ <b>UPI is currently under maintenance.</b>\n\n✅ Please use <b>Amazon Gift Card</b> for deposits.", main_menu($is_admin));
         exit;
     }
 
     // ================= ADMIN =================
     if ($text === "🧾 Update UPI QR") {
         if (!$is_admin) { sendMessage($chat_id, "❌ Admin only."); exit; }
+        // Keep this option if you want to set QR later; otherwise you can remove.
         set_state($user_id, "ADMIN_AWAIT_UPI_QR", []);
         sendMessage($chat_id, "📸 Send the new UPI QR image now:");
         exit;
@@ -855,7 +775,7 @@ if ($message) {
     }
 
     // If photo sent unexpectedly
-    if ($photo && !in_array($state, ["AWAIT_AMAZON_PHOTO","AWAIT_UPI_SS","ADMIN_AWAIT_UPI_QR"], true)) {
+    if ($photo && !in_array($state, ["AWAIT_AMAZON_PHOTO","ADMIN_AWAIT_UPI_QR"], true)) {
         sendMessage($chat_id, "❌ Photo not expected now. Use menu buttons.", main_menu($is_admin));
         exit;
     }
@@ -878,6 +798,12 @@ if ($callback) {
     ensure_user($user_id, $username);
     $is_admin = isAdmin($user_id);
 
+    // --- Maintenance dummy button ---
+    if ($data === "noop_upi_maintenance") {
+        answerCallback($cb_id, "UPI is under maintenance ❌", true);
+        exit;
+    }
+
     // Payment method selection
     if ($data === "pay:amazon") {
         answerCallback($cb_id, "Amazon selected");
@@ -886,10 +812,10 @@ if ($callback) {
         exit;
     }
 
+    // ✅ UPI BLOCKED (even if old messages have the UPI button)
     if ($data === "pay:upi") {
-        answerCallback($cb_id, "UPI selected");
-        set_state($user_id, "AWAIT_UPI_COINS", []);
-        sendMessage($chat_id, "How much coins you need? (Minimum: 30)");
+        answerCallback($cb_id, "UPI is under maintenance ❌", true);
+        sendMessage($chat_id, "🛠️ <b>UPI is currently under maintenance.</b>\n\n✅ Please use <b>Amazon Gift Card</b> for deposits right now.");
         exit;
     }
 
@@ -902,21 +828,10 @@ if ($callback) {
         exit;
     }
 
-    // UPI "I Have Paid"
+    // (UPI callbacks disabled)
     if (preg_match('/^upi_paid:(\d+)$/', $data, $m)) {
-        $order_id = intval($m[1]);
-        $o = get_order($order_id);
-        if (!$o || intval($o["user_id"]) !== intval($user_id)) {
-            answerCallback($cb_id, "Invalid order", true);
-            exit;
-        }
-        if ($o["status"] !== "PENDING") {
-            answerCallback($cb_id, "Already submitted", true);
-            exit;
-        }
-        answerCallback($cb_id, "OK");
-        set_state($user_id, "AWAIT_UPI_PAYER_NAME", ["order_id"=>$order_id]);
-        sendMessage($chat_id, "Send the payer name (person who paid):");
+        answerCallback($cb_id, "UPI is under maintenance ❌", true);
+        sendMessage($chat_id, "🛠️ <b>UPI is currently under maintenance.</b>\n\n✅ Please use <b>Amazon Gift Card</b> for deposits.");
         exit;
     }
 
@@ -1001,7 +916,7 @@ if ($callback) {
         exit;
     }
 
-    // Admin accept deposit (works for Amazon + UPI)
+    // Admin accept deposit (works for Amazon)
     if (preg_match('/^admin_dep_ok:(\d+)$/', $data, $m)) {
         if (!$is_admin) { answerCallback($cb_id, "Admin only", true); exit; }
         $order_id = intval($m[1]);
